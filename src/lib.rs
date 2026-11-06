@@ -13,11 +13,9 @@ use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use etherparse::{
-    InternetSlice::{Ipv4, Ipv6},
-    IpNumber, SlicedPacket,
+use crate::ipv4_util::{
+    IpNumber, ipv4_dst_ip, ipv4_header_len, ipv4_protocol, ipv4_src_ip, is_ipv4,
 };
-
 use crate::tcp::{SlappTcpError, TcpSession};
 use crate::tcp_util::{
     TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET, TCP_SRCPORT_OFFSET, tcp_header_len,
@@ -184,38 +182,22 @@ where
     NetSpy: NetworkSlappSpy,
     PW: PayloadWrapper,
 {
-    // TODO: remove etherparse dependency
     fn on_payload(&mut self, mut rf: PW) -> Vec<SlappInterceptVerdict<PW>> {
         let payload = rf.get_payload_mut();
-        let Ok(parsed) = SlicedPacket::from_ip(payload) else {
-            return vec![SlappInterceptVerdict::Accept(rf)];
-        };
+        if !is_ipv4(payload) {
+            panic!("Non-IPv4 packet")
+        }
 
-        let (src_ip, dst_ip, protocol, ip_header_len) = match &parsed.net {
-            Some(Ipv4(ip)) => {
-                let header = ip.header();
-
-                (
-                    header.source(),
-                    header.destination(),
-                    header.protocol(),
-                    (header.ihl() * 4) as usize,
-                )
-            }
-            Some(Ipv6(..)) => {
-                panic!("IPv6 is not supported");
-            }
-            _ => {
-                panic!("Non-IP packet");
-            }
-        };
-        drop(parsed);
+        let src_ip = ipv4_src_ip(payload);
+        let dst_ip = ipv4_dst_ip(payload);
+        let protocol = ipv4_protocol(payload);
+        let ip_header_len = ipv4_header_len(payload) as usize;
 
         let (ip_header, transport_payload) = payload.split_at(ip_header_len);
 
         self.net_spy.before(ip_header, transport_payload);
 
-        let verdicts = if protocol == IpNumber::TCP {
+        let verdicts = if IpNumber::TCP == protocol {
             let msg_parent = MessageParent::<PW> {
                 message: rf,
                 ip_header_len,

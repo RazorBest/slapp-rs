@@ -1,7 +1,39 @@
-pub const SRC_IPV4_OFFSET: usize = 12;
-pub const DST_IPV4_OFFSET: usize = 16;
-pub const IPV4_TOTAL_LENGTH_OFFSET: usize = 2;
+pub const IPV4_VERSION_OFFSET: usize = 0;
 pub const IPV4_HEADER_LENGTH_OFFSET: usize = 0;
+pub const IPV4_TOTAL_LENGTH_OFFSET: usize = 2;
+pub const IPV4_PROTOCOL_OFFSET: usize = 9;
+pub const IPV4_SRC_OFFSET: usize = 12;
+pub const IPV4_DST_OFFSET: usize = 16;
+pub const IP4_VERSION: u8 = 4;
+
+#[repr(u8)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum IpNumber {
+    ICMP = 1,
+    IGMP = 2,
+    TCP = 6,
+    UDP = 17,
+    IPV6 = 41,
+    GRE = 47,
+    ESP = 50,
+    AH = 51,
+    OSPF = 89,
+    VRRP = 112,
+    SCTP = 132,
+}
+
+impl Copy for IpNumber {}
+
+impl PartialEq<u8> for IpNumber {
+    fn eq(&self, other: &u8) -> bool {
+        *self as u8 == *other
+    }
+}
+
+#[inline(always)]
+pub fn ipv4_version(payload: &[u8]) -> u8 {
+    (payload[IPV4_VERSION_OFFSET] & 0xF0) >> 4
+}
 
 #[inline(always)]
 pub fn ipv4_header_len(payload: &[u8]) -> u8 {
@@ -16,16 +48,28 @@ pub fn ipv4_total_len(payload: &[u8]) -> u16 {
     ])
 }
 
+#[inline(always)]
+pub fn ipv4_protocol(payload: &[u8]) -> u8 {
+    payload[IPV4_PROTOCOL_OFFSET]
+}
+
 pub fn ipv4_src_ip(payload: &[u8]) -> [u8; 4] {
-    payload[SRC_IPV4_OFFSET..SRC_IPV4_OFFSET + 4]
+    payload[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4]
         .try_into()
         .unwrap()
 }
 
 pub fn ipv4_dst_ip(payload: &[u8]) -> [u8; 4] {
-    payload[DST_IPV4_OFFSET..DST_IPV4_OFFSET + 4]
+    payload[IPV4_DST_OFFSET..IPV4_DST_OFFSET + 4]
         .try_into()
         .unwrap()
+}
+
+pub fn is_ipv4(payload: &[u8]) -> bool {
+    payload.len() > IPV4_VERSION_OFFSET
+        && ipv4_version(payload) == IP4_VERSION
+        && (20..=60).contains(&ipv4_header_len(payload))
+        && (ipv4_header_len(payload) as usize) < payload.len()
 }
 
 #[inline(always)]
