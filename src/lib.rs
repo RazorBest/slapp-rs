@@ -4,22 +4,19 @@
 //!
 pub mod deque;
 pub mod ipv4_util;
+pub mod nfq;
 pub mod tcp;
 pub mod tcp_util;
 pub mod util;
 
+use core::marker::PhantomData;
 use std::collections::HashMap;
-use std::error::Error;
 use std::hash::Hash;
-use std::os::fd::{AsRawFd, RawFd};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use etherparse::{
     InternetSlice::{Ipv4, Ipv6},
     IpNumber, SlicedPacket,
 };
-use tokio::io::unix::AsyncFd;
 
 use crate::tcp::{SlappTcpError, TcpSession};
 use crate::tcp_util::{
@@ -48,11 +45,21 @@ impl InterceptVerdict {
     }
 }
 
-pub trait NetworkSlappHandler<RF> {
-    fn on_payload(&mut self, rf: RF) -> Vec<SlappInterceptVerdict<RF>>;
+pub trait PayloadWrapper {
+    fn get_payload_mut(&mut self) -> &mut [u8];
 }
 
-pub trait TransportSlappHandler<NetAddr, RF> {
+pub trait NetworkSlappHandler<PW>
+where
+    PW: PayloadWrapper,
+{
+    fn on_payload(&mut self, rf: PW) -> Vec<SlappInterceptVerdict<PW>>;
+}
+
+pub trait TransportSlappHandler<NetAddr, PW>
+where
+    PW: PayloadWrapper,
+{
     /*
      * Handles a TCP packet. Must guarantee that the packet is eventually
      * returned back in the verdict vector after subsequent calls.*/
@@ -60,8 +67,8 @@ pub trait TransportSlappHandler<NetAddr, RF> {
         &mut self,
         src_ip: NetAddr,
         dst_ip: NetAddr,
-        rf: RF,
-    ) -> Vec<SlappInterceptVerdict<RF>>;
+        rf: MessageParent<PW>,
+    ) -> Vec<SlappInterceptVerdict<MessageParent<PW>>>;
 }
 
 pub trait ApplicationDataSlappHandler {
@@ -142,215 +149,43 @@ impl TransportSlappSpy for NoSpy {
     }
 }
 
-#[derive(Clone)]
-pub struct SlappNfqNetOptions {
-    queue_num: u16,
-}
-
-impl SlappNfqNetOptions {
-    pub fn open_from_handler<NetHandler>(
-        &self,
-        net_handler: NetHandler,
-    ) -> Result<SlappNfqNet<NetHandler>, Box<dyn Error>>
-    where
-        NetHandler: NetworkSlappHandler<nfq::Message>,
-    {
-        SlappNfqNet::new_from_handler(self, net_handler)
-    }
-
-    pub fn open<NetHandler>(&self) -> Result<SlappNfqNet<NetHandler>, Box<dyn Error>>
-    where
-        NetHandler: NetworkSlappHandler<nfq::Message> + Default,
-    {
-        SlappNfqNet::new_from_handler(self, NetHandler::default())
-    }
-}
-
-pub struct SlappNfqNet<NetHandler>
-where
-    NetHandler: NetworkSlappHandler<nfq::Message>,
-{
-    pub queue: nfq::Queue,
-    pub async_fd: AsyncFd<RawFd>,
-    pub net_handler: NetHandler,
-}
-
-impl<NetHandler> SlappNfqNet<NetHandler>
-where
-    NetHandler: NetworkSlappHandler<nfq::Message>,
-{
-    /// Creates a new `Self` instance from `NetHandler`.
-    ///
-    /// # Arguments
-    ///
-    /// * `opts` - Configuration options.
-    /// * `net_handler` - An instance that handles network packets.
-    pub fn new_from_handler(
-        opts: &SlappNfqNetOptions,
-        net_handler: NetHandler,
-    ) -> Result<Self, Box<dyn Error>> {
-        let mut queue = nfq::Queue::open()?;
-        queue.bind(opts.queue_num)?;
-        queue.set_nonblocking(true);
-        queue.set_copy_range(opts.queue_num, u16::MAX)?;
-
-        let async_fd = AsyncFd::new(queue.as_raw_fd())?;
-
-        Ok(Self {
-            queue,
-            async_fd,
-            net_handler,
-        })
-    }
-
-    async fn get_next_msg(&mut self) -> Result<nfq::Message, Box<dyn Error + Send + Sync>> {
-        loop {
-            let mut guard = self.async_fd.readable().await?;
-
-            match self.queue.recv() {
-                Ok(msg) => {
-                    return Ok(msg);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    guard.clear_ready();
-                }
-                Err(err) => {
-                    return Err(err.into());
-                }
-            }
-        }
-    }
-
-    pub fn get_next_msg_blocking(&mut self) -> Result<nfq::Message, Box<dyn Error>> {
-        match self.queue.recv() {
-            Ok(msg) => Ok(msg),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                panic!("queue would block");
-            }
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    async fn verdict(&mut self, msg: nfq::Message) -> Result<(), Box<dyn Error>> {
-        let mut _guard = self.async_fd.writable().await?;
-
-        match self.queue.verdict(msg) {
-            Ok(msg) => Ok(msg),
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    pub fn verdict_blocking(&mut self, msg: nfq::Message) -> Result<(), Box<dyn Error>> {
-        Ok(self.queue.verdict(msg)?)
-    }
-
-    async fn wait_for_verdict(
-        &mut self,
-        running: Arc<AtomicBool>,
-        msg: nfq::Message,
-    ) -> Result<(), Box<dyn Error>> {
-        tokio::select! {
-            ret = self.verdict(msg) => {
-                ret?;
-            },
-            _ = tokio::spawn(async move {
-                while running.load(Ordering::SeqCst) {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                }
-            }) => (),
-        }
-
-        Ok(())
-    }
-
-    pub async fn intercept(
-        &mut self,
-        running: Arc<AtomicBool>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        while running.load(Ordering::SeqCst) {
-            let running_clone = running.clone();
-            let while_running = async move {
-                while running_clone.load(Ordering::SeqCst) {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                }
-            };
-            let msg = tokio::select! {
-                msg = self.get_next_msg() => {
-                    msg
-                },
-                _ = while_running => {
-                    // Trigger when `running` is set to false
-                    return Ok(());
-                },
-            }?;
-
-            {
-                let payload_len = msg.get_payload().len();
-                let original_len = msg.get_original_len();
-                if payload_len != original_len {
-                    println!("len / original: {} / {}", payload_len, original_len);
-                    panic!("Packet was truncated");
-                }
-            }
-
-            let verdicts = self.net_handler.on_payload(msg);
-
-            for vd in verdicts {
-                let msg = match vd {
-                    SlappInterceptVerdict::Accept(mut msg) => {
-                        msg.set_verdict(nfq::Verdict::Accept);
-
-                        msg
-                    }
-                    SlappInterceptVerdict::Drop(mut msg) => {
-                        msg.set_verdict(nfq::Verdict::Drop);
-
-                        msg
-                    }
-                    _ => {
-                        continue;
-                    }
-                };
-
-                self.wait_for_verdict(running.clone(), msg).await.unwrap();
-            }
-        }
-
-        Ok(())
-    }
-}
-
-type Ipv4Type = [u8; 4];
+pub type Ipv4Type = [u8; 4];
 
 #[derive(Default)]
-pub struct SlappNfqIpv4<TH, NetSpy>
+pub struct SlappIpv4<TH, NetSpy, PW>
 where
-    TH: TransportSlappHandler<Ipv4Type, NfqMessageParent>,
+    TH: TransportSlappHandler<Ipv4Type, PW>,
     NetSpy: NetworkSlappSpy,
+    PW: PayloadWrapper,
 {
     transport_handler: TH,
     net_spy: NetSpy,
+    _marker: PhantomData<PW>,
 }
 
-impl<TH, NetSpy> SlappNfqIpv4<TH, NetSpy>
+impl<TH, NetSpy, PW> SlappIpv4<TH, NetSpy, PW>
 where
-    TH: TransportSlappHandler<Ipv4Type, NfqMessageParent>,
+    TH: TransportSlappHandler<Ipv4Type, PW>,
     NetSpy: NetworkSlappSpy,
+    PW: PayloadWrapper,
 {
     pub fn new(transport_handler: TH, net_spy: NetSpy) -> Self {
         Self {
             transport_handler,
             net_spy,
+            _marker: PhantomData,
         }
     }
 }
 
-impl<NetSpy, TH> NetworkSlappHandler<nfq::Message> for SlappNfqIpv4<TH, NetSpy>
+impl<NetSpy, TH, PW> NetworkSlappHandler<PW> for SlappIpv4<TH, NetSpy, PW>
 where
-    TH: TransportSlappHandler<Ipv4Type, NfqMessageParent>,
+    TH: TransportSlappHandler<Ipv4Type, PW>,
     NetSpy: NetworkSlappSpy,
+    PW: PayloadWrapper,
 {
-    fn on_payload(&mut self, mut rf: nfq::Message) -> Vec<SlappInterceptVerdict<nfq::Message>> {
+    // TODO: remove etherparse dependency
+    fn on_payload(&mut self, mut rf: PW) -> Vec<SlappInterceptVerdict<PW>> {
         let payload = rf.get_payload_mut();
         let Ok(parsed) = SlicedPacket::from_ip(payload) else {
             return vec![SlappInterceptVerdict::Accept(rf)];
@@ -381,7 +216,7 @@ where
         self.net_spy.before(ip_header, transport_payload);
 
         let verdicts = if protocol == IpNumber::TCP {
-            let msg_parent = NfqMessageParent {
+            let msg_parent = MessageParent::<PW> {
                 message: rf,
                 ip_header_len,
             };
@@ -456,7 +291,7 @@ where
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TcpSessionMap<NetAddr, RF>
 where
     NetAddr: Copy + Hash + Ord + Default,
@@ -464,6 +299,19 @@ where
 {
     map: HashMap<NetAddrPair<NetAddr>, TcpSessionWithId<NetAddr, RF>>,
     id_counter: u64,
+}
+
+impl<NetAddr, RF> Default for TcpSessionMap<NetAddr, RF>
+where
+    NetAddr: Copy + Hash + Ord + Default,
+    RF: TransportPacketParent,
+{
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            id_counter: u64::default(),
+        }
+    }
 }
 
 impl<NetAddr, RF> TcpSessionMap<NetAddr, RF>
@@ -521,12 +369,18 @@ pub trait TransportPacketParent {
 }
 
 #[derive(Debug)]
-pub struct NfqMessageParent {
-    pub message: nfq::Message,
+pub struct MessageParent<PW>
+where
+    PW: PayloadWrapper,
+{
+    pub message: PW,
     pub ip_header_len: usize,
 }
 
-impl TransportPacketParent for NfqMessageParent {
+impl<PW> TransportPacketParent for MessageParent<PW>
+where
+    PW: PayloadWrapper,
+{
     fn split(&mut self) -> (&[u8], &mut [u8]) {
         let payload = self.message.get_payload_mut();
         let (net_header, tcp_payload) = payload.split_at_mut(self.ip_header_len);
@@ -536,26 +390,26 @@ impl TransportPacketParent for NfqMessageParent {
 }
 
 #[derive(Debug, Default)]
-pub struct SlappTcp<AH, TSpy, NetAddr, RF>
+pub struct SlappTcp<AH, TSpy, NetAddr, PW>
 where
     AH: ApplicationDataSlappHandler,
     TSpy: TransportSlappSpy,
     NetAddr: Copy + Hash + Ord + Default,
-    RF: TransportPacketParent,
+    PW: PayloadWrapper,
 {
-    pub sessions: TcpSessionMap<NetAddr, RF>,
+    pub sessions: TcpSessionMap<NetAddr, MessageParent<PW>>,
     pub transport_spy: TSpy,
     pub app_data_handler: AH,
     pub last_used_key: Option<(TcpAddr<NetAddr>, TcpAddr<NetAddr>)>,
     pub last_is_client: bool,
 }
 
-impl<AH, TSpy, NetAddr, RF> SlappTcp<AH, TSpy, NetAddr, RF>
+impl<AH, TSpy, NetAddr, PW> SlappTcp<AH, TSpy, NetAddr, PW>
 where
     AH: ApplicationDataSlappHandler,
     TSpy: TransportSlappSpy,
     NetAddr: Copy + Hash + Ord + Default,
-    RF: TransportPacketParent,
+    PW: PayloadWrapper,
 {
     pub fn new_from(app_data_handler: AH, transport_spy: TSpy) -> Self {
         Self {
@@ -569,8 +423,8 @@ where
 
     fn get_last_accessed_session(
         last_used_key: Option<(TcpAddr<NetAddr>, TcpAddr<NetAddr>)>,
-        sessions: &mut TcpSessionMap<NetAddr, RF>,
-    ) -> Option<&mut TcpSessionWithId<NetAddr, RF>> {
+        sessions: &mut TcpSessionMap<NetAddr, MessageParent<PW>>,
+    ) -> Option<&mut TcpSessionWithId<NetAddr, MessageParent<PW>>> {
         match last_used_key {
             None => None,
             Some((src_addr, dst_addr)) => Some(sessions.get_session(src_addr, dst_addr)),
@@ -578,19 +432,19 @@ where
     }
 }
 
-impl<NetAddr, TSpy, AH, RF> TransportSlappHandler<NetAddr, RF> for SlappTcp<AH, TSpy, NetAddr, RF>
+impl<NetAddr, TSpy, AH, PW> TransportSlappHandler<NetAddr, PW> for SlappTcp<AH, TSpy, NetAddr, PW>
 where
     NetAddr: Copy + Hash + Ord + Default,
     TSpy: TransportSlappSpy,
     AH: ApplicationDataSlappHandler,
-    RF: TransportPacketParent,
+    PW: PayloadWrapper,
 {
     fn on_transport_packet(
         &mut self,
         src_net: NetAddr,
         dst_net: NetAddr,
-        mut rf: RF,
-    ) -> Vec<SlappInterceptVerdict<RF>> {
+        mut rf: MessageParent<PW>,
+    ) -> Vec<SlappInterceptVerdict<MessageParent<PW>>> {
         let mut verdicts = vec![];
         let (net_header, tcp_payload) = rf.split();
         let src_port = u16::from_be_bytes([
@@ -746,14 +600,14 @@ where
     }
 }
 
-impl<AH, TSpy, NetAddr, RF> SlappTcp<AH, TSpy, NetAddr, RF>
+impl<AH, TSpy, NetAddr, PW> SlappTcp<AH, TSpy, NetAddr, PW>
 where
     AH: ApplicationDataSlappHandler,
     TSpy: TransportSlappSpy,
     NetAddr: Copy + Hash + Ord + Default,
-    RF: TransportPacketParent,
+    PW: PayloadWrapper,
 {
-    fn transport_packet_verdict_kept(&mut self) -> Vec<SlappInterceptVerdict<RF>> {
+    fn transport_packet_verdict_kept(&mut self) -> Vec<SlappInterceptVerdict<MessageParent<PW>>> {
         let Some(&mut TcpSessionWithId {
             ref mut session,
             session_id,
@@ -800,7 +654,7 @@ where
         upstream_verdicts
     }
 
-    fn drain_futures_from_last_session(&mut self) -> Vec<SlappInterceptVerdict<RF>> {
+    fn drain_futures_from_last_session(&mut self) -> Vec<SlappInterceptVerdict<MessageParent<PW>>> {
         let Some(&mut TcpSessionWithId {
             ref mut session,
             session_id,
@@ -852,81 +706,6 @@ where
         }
 
         upstream_verdicts
-    }
-}
-
-pub type SlappNfqIpv4Tcp<AH, NetSpy, TSpy> =
-    SlappNfqNet<SlappNfqIpv4<SlappTcp<AH, TSpy, Ipv4Type, NfqMessageParent>, NetSpy>>;
-
-impl<AH, NetSpy, TSpy> SlappNfqIpv4Tcp<AH, NetSpy, TSpy>
-where
-    AH: ApplicationDataSlappHandler,
-    NetSpy: NetworkSlappSpy,
-    TSpy: TransportSlappSpy,
-{
-    pub fn new_from_handlers(
-        opts: &SlappNfqNetOptions,
-        app_handler: AH,
-        net_spy: NetSpy,
-        transport_spy: TSpy,
-    ) -> Result<Self, Box<dyn Error>> {
-        let tcp = SlappTcp::new_from(app_handler, transport_spy);
-        let ip = SlappNfqIpv4::new(tcp, net_spy);
-
-        SlappNfqNet::new_from_handler(opts, ip)
-    }
-}
-
-impl<AH, NetSpy, TSpy> SlappNfqIpv4Tcp<AH, NetSpy, TSpy>
-where
-    AH: ApplicationDataSlappHandler + Default,
-    NetSpy: NetworkSlappSpy + Default,
-    TSpy: TransportSlappSpy + Default,
-{
-    pub fn new(opts: &SlappNfqNetOptions) -> Result<Self, Box<dyn Error>> {
-        let app_handler = AH::default();
-        let net_spy = NetSpy::default();
-        let transport_spy = TSpy::default();
-        Self::new_from_handlers(opts, app_handler, net_spy, transport_spy)
-    }
-}
-
-pub struct SlappNfqIpv4TcpOptions {
-    pub queue_num: u16,
-}
-
-impl From<&SlappNfqIpv4TcpOptions> for SlappNfqNetOptions {
-    fn from(obj: &SlappNfqIpv4TcpOptions) -> Self {
-        Self {
-            queue_num: obj.queue_num,
-        }
-    }
-}
-
-impl SlappNfqIpv4TcpOptions {
-    pub fn open<AH, NetSpy, TSpy>(
-        &self,
-    ) -> Result<SlappNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
-    where
-        AH: ApplicationDataSlappHandler + Default,
-        NetSpy: NetworkSlappSpy + Default,
-        TSpy: TransportSlappSpy + Default,
-    {
-        SlappNfqIpv4Tcp::new(&self.into())
-    }
-
-    pub fn open_from<AH, NetSpy, TSpy>(
-        &self,
-        app_handler: AH,
-        net_spy: NetSpy,
-        transport_spy: TSpy,
-    ) -> Result<SlappNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
-    where
-        AH: ApplicationDataSlappHandler,
-        NetSpy: NetworkSlappSpy,
-        TSpy: TransportSlappSpy,
-    {
-        SlappNfqIpv4Tcp::new_from_handlers(&self.into(), app_handler, net_spy, transport_spy)
     }
 }
 
@@ -1106,25 +885,27 @@ mod test_slapp_tcp {
 
     struct TParent {
         id: u64,
-        ip: Vec<u8>,
-        tcp: Vec<u8>,
+        packet: Vec<u8>,
+        ip_header_len: usize,
     }
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
     impl TParent {
-        fn new(ip: Vec<u8>, tcp: Vec<u8>) -> Self {
+        fn new(mut ip: Vec<u8>, mut tcp: Vec<u8>) -> Self {
+            let ip_header_len = ip.len();
+            ip.append(&mut tcp);
             Self {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                ip,
-                tcp,
+                packet: ip,
+                ip_header_len,
             }
         }
     }
 
-    impl TransportPacketParent for TParent {
-        fn split(&mut self) -> (&[u8], &mut [u8]) {
-            (&self.ip, &mut self.tcp)
+    impl PayloadWrapper for TParent {
+        fn get_payload_mut(&mut self) -> &mut [u8] {
+            &mut self.packet
         }
     }
 
@@ -1213,7 +994,12 @@ mod test_slapp_tcp {
 
     fn packet_expect_accept(th: &mut THandler, conn: &TcpConnection, packet: TParent) {
         let packet_id = packet.id;
-        let verdicts = th.on_transport_packet(conn.src_ip, conn.dst_ip, packet);
+        let ip_header_len = packet.ip_header_len;
+        let msg_parent = MessageParent {
+            message: packet,
+            ip_header_len,
+        };
+        let verdicts = th.on_transport_packet(conn.src_ip, conn.dst_ip, msg_parent);
         assert!(
             !verdicts.is_empty(),
             "The tcp handler must return a verdict"
@@ -1226,7 +1012,7 @@ mod test_slapp_tcp {
             panic!("The tcp handler's verdict must be ACCEPT");
         };
         assert_eq!(
-            rf.id, packet_id,
+            rf.message.id, packet_id,
             "The returned verdict must be for the provided packet"
         );
 
@@ -1258,7 +1044,12 @@ mod test_slapp_tcp {
             res.session_id
         };
 
-        let verdicts = th.on_transport_packet(conn.src_ip, conn.dst_ip, packet);
+        let ip_header_len = packet.ip_header_len;
+        let msg_parent = MessageParent {
+            message: packet,
+            ip_header_len,
+        };
+        let verdicts = th.on_transport_packet(conn.src_ip, conn.dst_ip, msg_parent);
         assert!(
             !verdicts.is_empty(),
             "The tcp handler must return a verdict"
@@ -1271,7 +1062,7 @@ mod test_slapp_tcp {
             panic!("The tcp handler's verdict must be ACCEPT");
         };
         assert_eq!(
-            rf.id, packet_id,
+            rf.message.id, packet_id,
             "The returned verdict must be for the provided packet"
         );
 
