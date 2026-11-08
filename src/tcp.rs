@@ -2109,7 +2109,93 @@ mod test_tcp_peer_tracker_buffer {
     }
 
     #[test]
-    fn test_future_seq_wrap_and_eat_before_wrap() {
+    fn test_future_seq_wrap_and_eat_after_wrap() {
+        // This tests depends on buffer size being 100
+        let mut t = tcp_peer_tracker();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 11, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
+
+        // First segment (not wrapping)
+        let data1 = pseudorandom_data(4);
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 10, None, &data1)
+            .unwrap();
+        assert_eq!(written, data1.len());
+
+        // Second segment (future, not data crossing)
+        let data2 = pseudorandom_data(2);
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 5, None, &data2)
+            .unwrap();
+        assert_eq!(written, 0);
+        let (buf1, buf2) = t.get_last_written_from_buffer(written);
+        assert_eq!(buf1, &[]);
+        assert_eq!(buf2, &[]);
+
+        // Third segment (future, gapped, data crossing)
+        let data3 = pseudorandom_data(10);
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 2, None, &data3)
+            .unwrap();
+        assert_eq!(written, 0);
+        let (buf1, buf2) = t.get_last_written_from_buffer(written);
+        assert_eq!(buf1, &[]);
+        assert_eq!(buf2, &[]);
+
+        // Fourth segment (future, gapped, wrapping)
+        let data4 = pseudorandom_data(5);
+        let written = t.update_and_copy_assume_new(0, 9, None, &data4).unwrap();
+        assert_eq!(written, 0);
+        let (buf1, buf2) = t.get_last_written_from_buffer(written);
+        assert_eq!(buf1, &[]);
+        assert_eq!(buf2, &[]);
+
+        // Fifth segment, eating second, third, part of fourth, and the missing gaps
+        let miss1 = pseudorandom_data(1);
+        let miss2 = pseudorandom_data(1);
+        let miss3 = pseudorandom_data(2);
+        let data: Vec<_> = miss1
+            .iter()
+            .chain(&data2)
+            .chain(&miss2)
+            .chain(&data3)
+            .chain(&miss3)
+            .chain(&data4[..2])
+            .copied()
+            .collect();
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 6, None, &data)
+            .unwrap();
+        assert_eq!(written, data.len());
+        let (buf1, buf2) = t.get_last_written_from_buffer(written);
+        assert_eq!(buf1, &data);
+        assert_eq!(buf2, &[]);
+
+        let mut verdicts = t.update_future_queue();
+        assert_eq!(verdicts.len(), 3);
+
+        let v = &mut verdicts[0];
+        assert_eq!(v.new_data_len, 0);
+        let payload = v.get_data();
+        assert_eq!(payload, data2);
+
+        let v = &mut verdicts[1];
+        assert_eq!(v.new_data_len, 0);
+        let payload = v.get_data();
+        assert_eq!(payload, data3);
+
+        let v = &mut verdicts[2];
+        assert_eq!(v.new_data_len, 3);
+        let payload = v.get_data();
+        assert_eq!(payload, &data4);
+    }
+
+    #[test]
+    fn test_future_seq_wrap_and_eat_before_data_cross() {
+        // Data cross means that the data bytes cross the SEQ limit boundary,
+        // while the SEQ itself still doesn't cross it
         // This tests depends on buffer size being 100
         let mut t = tcp_peer_tracker();
         let _ = t
