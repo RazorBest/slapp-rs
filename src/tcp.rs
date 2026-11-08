@@ -258,9 +258,9 @@ where
             .....S......................EX1....X2
             .....S......................E..X1..X2
         */
-        let buffer_len = self.buffer.len() as i64;
-        let data_len = data.len() as i64;
-        let curr_seq = self.buffer.seq as i64;
+        let buffer_len = self.buffer.len() as u32;
+        let data_len = data.len() as u32;
+        let curr_seq = self.buffer.seq;
 
         if (flags & SYN_MASK) != 0 && !data.is_empty() {
             return Err(NonZeroDataLengthInSyn);
@@ -310,22 +310,16 @@ where
             return Err(PacketTooBigError);
         }
 
-        let next_seq = next_seq as i64;
-
         // 1 <= X2 - E <= window_len, otherwise it's old data or outside the window
-        let new_data_len = (next_seq + data_len - curr_seq) % SEQ_LIM;
+        let new_data_len = next_seq.wrapping_add(data_len).wrapping_sub(curr_seq);
         if !(0..=buffer_len).contains(&new_data_len) {
-            let right_offset = (SEQ_LIM - new_data_len) % SEQ_LIM;
-            if !(0..buffer_len).contains(&right_offset) {
-                return Err(PacketOutsideWindow);
-            }
-            // seq_end is in the window, but not next_seq
-            if right_offset + data_len > buffer_len {
+            if !self.buffer.seq_in_buf(next_seq)
+                || !self.buffer.seq_in_buf(next_seq.wrapping_add(data_len))
+            {
                 return Err(PacketOutsideWindow);
             }
 
-            self.buffer
-                .write_from_buffer_to_slice(data, next_seq as u32);
+            self.buffer.write_from_buffer_to_slice(data, next_seq);
 
             return Ok((
                 data_len as usize,
@@ -338,15 +332,15 @@ where
             ));
         }
 
-        // X1 <= E, otherwise it's future
-        let old_data_len = data_len - new_data_len;
-        if !(0..=buffer_len).contains(&old_data_len) {
+        // If future
+        if new_data_len > data_len {
             return Ok((0, None, None, true, false, false, self.is_fin()));
         }
 
+        let old_data_len = data_len - new_data_len;
         if old_data_len > 0 {
             self.buffer
-                .write_from_buffer_to_slice(&mut data[..old_data_len as usize], next_seq as u32);
+                .write_from_buffer_to_slice(&mut data[..old_data_len as usize], next_seq);
         }
 
         let mut increase_data_len = new_data_len;
