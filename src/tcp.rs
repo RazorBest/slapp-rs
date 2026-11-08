@@ -2526,7 +2526,7 @@ mod test_tcp_peer_tracker_state {
     }
 
     #[test]
-    fn test_fin_retranmistted_diferently() {
+    fn test_fin_retransmitted_diferently() {
         let mut t = tcp_peer_tracker();
         let _ = t
             .update_and_copy_assume_new(SYN_MASK, 20, None, &[])
