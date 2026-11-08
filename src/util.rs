@@ -1,3 +1,5 @@
+use std::cmp::max;
+
 use crate::deque::DequeSliceMut;
 use crate::ipv4_util::ipv4_header_len;
 use crate::tcp_util::update_checksum_tcp_ipv4;
@@ -7,7 +9,9 @@ pub const SEQ_LIM: i64 = u32::MAX as i64 + 1;
 #[derive(Clone, Debug)]
 pub struct CircularSeqBuffer {
     pub buffer: Vec<u8>,
+    /// Index after the last written byte
     pub end: u32,
+    /// The sequence number corresponding to the end index
     pub seq: u32,
 }
 
@@ -36,13 +40,21 @@ impl CircularSeqBuffer {
         (1..=self.len() as i64).contains(&diff)
     }
 
+    /// Returns the new data from a packet with the given SEQ and data length relative to the
+    /// current buffer
     pub fn get_new(&self, next_seq: u32, data_len: usize) -> i64 {
-        let mut new_data_len = (next_seq as i64 + data_len as i64 - (self.seq as i64)) % SEQ_LIM;
-        if (new_data_len + self.len() as i64) % SEQ_LIM < self.len() as i64 {
-            new_data_len = 0;
+        // seq_first is the sequence number of the first valid byte (which corresponds to end, the next writable
+        // byte)
+        let seq_first = self.seq.wrapping_sub(self.len() as u32);
+        let packet_seq_end = next_seq.wrapping_add((max(data_len, 1) - 1) as u32);
+        // If the seq of the last byte of the packet is contained in the buffer, then no byte is new
+        if (0..self.len() as u32).contains(&packet_seq_end.wrapping_sub(seq_first)) {
+            return 0;
         }
 
-        new_data_len
+        next_seq
+            .wrapping_add(data_len as u32)
+            .wrapping_sub(self.seq) as i64
     }
 
     pub fn len(&self) -> usize {
