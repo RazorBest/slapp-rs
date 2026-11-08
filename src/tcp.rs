@@ -2039,7 +2039,9 @@ mod test_tcp_peer_tracker_buffer {
     }
 
     #[test]
-    fn test_future_seq_wrap_and_eat_after_wrap() {
+    fn test_future_seq_wrap_and_eat_after_data_cross() {
+        // Data cross means that the data bytes cross the SEQ limit boundary,
+        // while the SEQ itself still doesn't cross it
         // This tests depends on buffer size being 100
         let mut t = tcp_peer_tracker();
         let _ = t
@@ -2054,7 +2056,7 @@ mod test_tcp_peer_tracker_buffer {
             .unwrap();
         assert_eq!(written, data1.len());
 
-        // Second segment (future, not wrapping)
+        // Second segment (future, not data crossing)
         let data2 = pseudorandom_data(2);
         let written = t
             .update_and_copy_assume_new(0, u32::MAX - 5, None, &data2)
@@ -2064,7 +2066,7 @@ mod test_tcp_peer_tracker_buffer {
         assert_eq!(buf1, &[]);
         assert_eq!(buf2, &[]);
 
-        // Third segment (future, gapped, wrapping)
+        // Third segment (future, gapped, data crossing)
         let data3 = pseudorandom_data(10);
         let written = t
             .update_and_copy_assume_new(0, u32::MAX - 2, None, &data3)
