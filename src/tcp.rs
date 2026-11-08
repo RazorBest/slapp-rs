@@ -489,8 +489,41 @@ where
     ///
     /// The caller must update self.future_size
     fn add_future_packet(&mut self, packet: FuturePacket<RF>) {
-        self.future.push(packet);
-        self.future.sort();
+        // Sorting works if the buffer size is less than equal to u32::MAX / 4
+        // If you need bigger buffer sizes, you might need to rethink the entire code for futures
+        assert!(MAX_FUTURE_SIZE < (u32::MAX / 4) as usize);
+        if self.future.is_empty() {
+            self.future.push(packet);
+            return;
+        }
+
+        // Decide which one is smaller: the first packet in future or the current packet
+        if packet.seq < self.future[0].seq {
+            // The current packet is smaller
+            if self.future[0].seq - packet.seq <= u32::MAX / 4 {
+                self.future.insert(0, packet);
+            // The first packet in future is smaller because the current packet wrapped around
+            } else {
+                self.future.push(packet);
+                // Then, we can safely use the first packet as an offset for all the others
+                let offset = self.future[0].seq;
+                self.future
+                    .sort_by_key(|packet| packet.seq.wrapping_sub(offset));
+            }
+        } else {
+            // The first packet in future is smaller
+            if packet.seq - self.future[0].seq <= u32::MAX / 4 {
+                self.future.push(packet);
+                // Then, we can safely use the first packet as an offset for all the others
+                let offset = self.future[0].seq;
+                self.future
+                    .sort_by_key(|packet| packet.seq.wrapping_sub(offset));
+            // The current packet is smaller, because the first packet from the futures wrapped
+            // around
+            } else {
+                self.future.insert(0, packet);
+            }
+        }
     }
 
     pub fn add_future_payload(&mut self, mut rf: RF) -> std::result::Result<(), (RF, SlappTcpError)>
