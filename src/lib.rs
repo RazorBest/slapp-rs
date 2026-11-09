@@ -157,8 +157,8 @@ where
     NetSpy: NetworkSlappSpy,
     PW: PayloadWrapper,
 {
-    transport_handler: TH,
-    net_spy: NetSpy,
+    pub transport_handler: TH,
+    pub net_spy: NetSpy,
     _marker: PhantomData<PW>,
 }
 
@@ -280,8 +280,8 @@ where
     NetAddr: Copy + Hash + Ord + Default,
     RF: TransportPacketParent,
 {
-    map: HashMap<NetAddrPair<NetAddr>, TcpSessionWithId<NetAddr, RF>>,
-    id_counter: u64,
+    pub map: HashMap<NetAddrPair<NetAddr>, TcpSessionWithId<NetAddr, RF>>,
+    pub id_counter: u64,
 }
 
 impl<NetAddr, RF> Default for TcpSessionMap<NetAddr, RF>
