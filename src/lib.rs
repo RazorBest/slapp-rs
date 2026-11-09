@@ -3,6 +3,7 @@
 //! Skip the nasty stuff. Get visibility.
 //!
 pub mod deque;
+pub mod inmemory;
 pub mod ipv4_util;
 pub mod nfq;
 pub mod tcp;
