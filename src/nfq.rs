@@ -16,9 +16,10 @@ impl PayloadWrapper for nfq::Message {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Default)]
 pub struct SlappNfqNetOptions {
-    queue_num: u16,
+    pub queue_num: u16,
+    pub max_queue_len: Option<u32>,
 }
 
 impl SlappNfqNetOptions {
@@ -66,6 +67,9 @@ where
         queue.bind(opts.queue_num)?;
         queue.set_nonblocking(true);
         queue.set_copy_range(opts.queue_num, u16::MAX)?;
+        if let Some(max_queue_len) = opts.max_queue_len {
+            queue.set_queue_max_len(opts.queue_num, max_queue_len)?;
+        }
 
         Ok(Self { queue, net_handler })
     }
@@ -233,44 +237,5 @@ where
         let net_spy = NetSpy::default();
         let transport_spy = TSpy::default();
         Self::new_from_handlers(opts, app_handler, net_spy, transport_spy)
-    }
-}
-
-pub struct SlappNfqIpv4TcpOptions {
-    pub queue_num: u16,
-}
-
-impl From<&SlappNfqIpv4TcpOptions> for SlappNfqNetOptions {
-    fn from(obj: &SlappNfqIpv4TcpOptions) -> Self {
-        Self {
-            queue_num: obj.queue_num,
-        }
-    }
-}
-
-impl SlappNfqIpv4TcpOptions {
-    pub fn open<AH, NetSpy, TSpy>(
-        &self,
-    ) -> Result<SlappNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
-    where
-        AH: ApplicationDataSlappHandler + Default,
-        NetSpy: NetworkSlappSpy + Default,
-        TSpy: TransportSlappSpy + Default,
-    {
-        SlappNfqIpv4Tcp::new(&self.into())
-    }
-
-    pub fn open_from<AH, NetSpy, TSpy>(
-        &self,
-        app_handler: AH,
-        net_spy: NetSpy,
-        transport_spy: TSpy,
-    ) -> Result<SlappNfqIpv4Tcp<AH, NetSpy, TSpy>, Box<dyn Error>>
-    where
-        AH: ApplicationDataSlappHandler,
-        NetSpy: NetworkSlappSpy,
-        TSpy: TransportSlappSpy,
-    {
-        SlappNfqIpv4Tcp::new_from_handlers(&self.into(), app_handler, net_spy, transport_spy)
     }
 }
