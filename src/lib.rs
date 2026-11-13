@@ -19,7 +19,7 @@ use crate::ipv4_util::{
 };
 use crate::tcp::{SlappTcpError, TcpSession};
 use crate::tcp_util::{
-    TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET, TCP_SRCPORT_OFFSET, tcp_header_len,
+    TCP_DSTPORT_OFFSET, TCP_SEQ_OFFSET, TCP_SRCPORT_OFFSET, tcp_header_len, tcp_seq,
     update_checksum_tcp_ipv4,
 };
 
@@ -590,15 +590,14 @@ where
     NetAddr: Copy + Hash + Ord + Default,
     PW: PayloadWrapper,
 {
-    fn transport_packet_verdict_kept(&mut self) -> Vec<SlappInterceptVerdict<MessageParent<PW>>> {
-        let Some(&mut TcpSessionWithId {
-            ref mut session,
-            session_id,
-        }) = Self::get_last_accessed_session(self.last_used_key, &mut self.sessions)
-        else {
-            return vec![];
-        };
-        let future_verdicts = session.verdict_kept(self.last_is_client);
+    fn transport_packet_verdict_kept_one_pass(
+        session: &mut TcpSession<NetAddr, MessageParent<PW>>,
+        session_id: u64,
+        is_client: bool,
+        app_data_handler: &mut AH,
+        transport_spy: &mut TSpy,
+    ) -> Vec<SlappInterceptVerdict<MessageParent<PW>>> {
+        let future_verdicts = session.verdict_kept(is_client);
         let mut upstream_verdicts = vec![];
         for mut vd in future_verdicts {
             let mut parent = vd.rf;
@@ -607,31 +606,52 @@ where
             let new_data_len = vd.new_data_len;
             let old_data_len = tcp_payload.len() - header_len - new_data_len;
 
-            let mut seq = u32::from_be_bytes([
-                tcp_payload[TCP_SEQ_OFFSET],
-                tcp_payload[TCP_SEQ_OFFSET + 1],
-                tcp_payload[TCP_SEQ_OFFSET + 2],
-                tcp_payload[TCP_SEQ_OFFSET + 3],
-            ]);
-            seq = seq.wrapping_add(old_data_len as u32);
+            let seq = tcp_seq(tcp_payload).wrapping_add(old_data_len as u32);
 
             let (tcp_header, data) = tcp_payload.split_at_mut(header_len);
             let new_data = &mut data[old_data_len..];
 
-            self.app_data_handler
-                .on_data(session_id, self.last_is_client, seq as i64, new_data);
+            app_data_handler.on_data(session_id, is_client, seq as i64, new_data);
+
             vd.writable.copy_from_slice(new_data);
 
-            self.transport_spy.after(
+            transport_spy.after(
                 net_header,
                 tcp_header,
-                self.last_is_client,
+                is_client,
                 data,
                 session_id,
                 &InterceptVerdict::Accept,
             );
 
             upstream_verdicts.push(SlappInterceptVerdict::Accept(parent));
+        }
+
+        upstream_verdicts
+    }
+
+    fn transport_packet_verdict_kept(&mut self) -> Vec<SlappInterceptVerdict<MessageParent<PW>>> {
+        let Some(&mut TcpSessionWithId {
+            ref mut session,
+            session_id,
+        }) = Self::get_last_accessed_session(self.last_used_key, &mut self.sessions)
+        else {
+            return vec![];
+        };
+
+        let mut upstream_verdicts = vec![];
+        loop {
+            let new_verdicts = Self::transport_packet_verdict_kept_one_pass(
+                session,
+                session_id,
+                self.last_is_client,
+                &mut self.app_data_handler,
+                &mut self.transport_spy,
+            );
+            if new_verdicts.is_empty() {
+                break;
+            }
+            upstream_verdicts.extend(new_verdicts);
         }
 
         upstream_verdicts

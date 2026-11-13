@@ -423,6 +423,7 @@ where
         let mut old_future = vec![];
         mem::swap(&mut self.future, &mut old_future);
         self.future_size = 0;
+        let mut had_future_with_new_data = false;
         // Futures are sorted
         for mut packet in old_future {
             let &mut FuturePacket {
@@ -436,13 +437,21 @@ where
             let new_data_len = self.buffer.get_new(next_seq, data_len as usize);
             let old_data_len = data_len - new_data_len;
 
-            // Still a future packet
-            if !(0..=data_len).contains(&old_data_len) {
+            // First OR hand: Still a future packet
+            // Second OR hand: Even if not a future, we can still not pull packets that contain old data that
+            // overlaps any of the currently pulled futures
+            if !(0..=data_len).contains(&old_data_len)
+                || (old_data_len > 0 && had_future_with_new_data)
+            {
                 self.future_size += tcp_payload.len();
                 self.add_future_packet(packet);
                 continue;
             }
             let old_data_len = old_data_len as usize;
+
+            if new_data_len > 0 {
+                had_future_with_new_data = true;
+            }
 
             if old_data_len > 0 {
                 self.buffer.write_from_buffer_to_slice(
@@ -1730,8 +1739,11 @@ mod test_tcp_peer_tracker_buffer {
         assert_eq!(buf1, &data[2..]);
         assert_eq!(buf2, &[]);
 
+        // Even if the second segment overlaps with the third, it doesn't have any new data
+        // The fourth segment doesn't overlap with the third
+        // The fifth segment overlaps with the fourth, and is not pulled from the future queue
         let mut verdicts = t.update_future_queue();
-        assert_eq!(verdicts.len(), 4);
+        assert_eq!(verdicts.len(), 3);
 
         let v = &mut verdicts[0];
         assert_eq!(v.new_data_len, 0);
@@ -1743,12 +1755,21 @@ mod test_tcp_peer_tracker_buffer {
         let payload = v.get_data();
         assert_eq!(payload.len(), 3 + data3.len());
 
+        // update_future_queue doesnt do the buffer writing
+        v.writable.copy_from_slice(&data3);
+
         let v = &mut verdicts[2];
         assert_eq!(v.new_data_len, data4.len());
         let payload = v.get_data();
         assert_eq!(payload.len(), data4.len());
 
-        let v = &mut verdicts[3];
+        // update_future_queue doesnt do the buffer writing
+        v.writable.copy_from_slice(&data4);
+
+        let mut verdicts = t.update_future_queue();
+        assert_eq!(verdicts.len(), 1);
+
+        let v = &mut verdicts[0];
         assert_eq!(v.new_data_len, data5.len());
         let payload = v.get_data();
         assert_eq!(payload.len(), 4 + data5.len());
@@ -2324,6 +2345,90 @@ mod test_tcp_peer_tracker_buffer {
 
         // The proper ordering must be data2, data4, data3
         assert_eq!(payloads, &[data2, data4, data3])
+    }
+
+    #[test]
+    fn test_future_retransmitted() {
+        let mut t = tcp_peer_tracker();
+        let _ = t
+            .update_and_copy_assume_new(SYN_MASK, u32::MAX - 11, None, &[])
+            .unwrap();
+        t.establish_connection_after_syn();
+
+        // First segment
+        let data1 = pseudorandom_data(4);
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 10, None, &data1)
+            .unwrap();
+        assert_eq!(written, data1.len());
+
+        // Second segment (future)
+        let data2 = pseudorandom_data(2);
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 5, None, &data2)
+            .unwrap();
+        assert_eq!(written, 0);
+        let (buf1, buf2) = t.get_last_written_from_buffer(written);
+        assert_eq!(buf1, &[]);
+        assert_eq!(buf2, &[]);
+
+        // Third segment (future)
+        let data3 = pseudorandom_data(10);
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 3, None, &data3)
+            .unwrap();
+        assert_eq!(written, 0);
+        let (buf1, buf2) = t.get_last_written_from_buffer(written);
+        assert_eq!(buf1, &[]);
+        assert_eq!(buf2, &[]);
+
+        // Third segment retransmitted
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 3, None, &data3)
+            .unwrap();
+        assert_eq!(written, 0);
+        let (buf1, buf2) = t.get_last_written_from_buffer(written);
+        assert_eq!(buf1, &[]);
+        assert_eq!(buf2, &[]);
+
+        // Fourth segment, filling the gap between the first and second
+        let miss1 = pseudorandom_data(1);
+        let written = t
+            .update_and_copy_assume_new(0, u32::MAX - 6, None, &miss1)
+            .unwrap();
+        assert_eq!(written, miss1.len());
+        let (buf1, buf2) = t.get_last_written_from_buffer(written);
+        assert_eq!(buf1, &miss1);
+        assert_eq!(buf2, &[]);
+
+        let mut verdicts = t.update_future_queue();
+        assert_eq!(verdicts.len(), 2);
+
+        let v = &mut verdicts[0];
+        assert_eq!(v.new_data_len, 2);
+        let payload = v.get_data();
+        assert_eq!(payload, data2);
+
+        // update_future_queue doesnt do the buffer writing
+        v.writable.copy_from_slice(&data2);
+
+        let v = &mut verdicts[1];
+        assert_eq!(v.new_data_len, data3.len());
+        let payload = v.get_data();
+        assert_eq!(payload, data3);
+
+        // update_future_queue doesnt do the buffer writing
+        v.writable.copy_from_slice(&data3);
+
+        // We need a second pass because the last future overlapped with the second
+        let mut verdicts = t.update_future_queue();
+        assert_eq!(verdicts.len(), 1);
+
+        let v = &mut verdicts[0];
+        // It's a retransmission
+        assert_eq!(v.new_data_len, 0);
+        let payload = v.get_data();
+        assert_eq!(payload, data3);
     }
 
     #[test]

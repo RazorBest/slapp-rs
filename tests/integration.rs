@@ -134,10 +134,14 @@ fn ensure_packets_not_modified(
     packets: HashMap<u64, Vec<u8>>,
     verdicts: impl Iterator<Item = SlappInmemoryVerdict>,
 ) {
-    for verdict in verdicts {
+    for (i, verdict) in verdicts.enumerate() {
         match verdict {
             SlappInmemoryVerdict::Accept(mp) => {
-                assert_eq!(mp.data, packets[&mp.id]);
+                assert_eq!(
+                    mp.data, packets[&mp.id],
+                    "packet counter (0-indexed): {i}. id: {}",
+                    mp.id
+                );
             }
             _ => {
                 panic!("Unexpected verdict: {verdict:?}");
@@ -205,6 +209,14 @@ fn test_pcap_scenario6() {
 #[test]
 fn test_pcap_scenario7() {
     let mut replayer = Replayer::new(Path::new("./tests/scenarios/scenario7.pcap"))
+        .expect("Failed initializing replayer");
+    let (packets, verdicts) = replayer.replay();
+    ensure_packets_not_modified(packets, verdicts);
+}
+
+#[test]
+fn test_pcap_scenario8() {
+    let mut replayer = Replayer::new(Path::new("./tests/scenarios/scenario8.pcap"))
         .expect("Failed initializing replayer");
     let (packets, verdicts) = replayer.replay();
     ensure_packets_not_modified(packets, verdicts);
