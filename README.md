@@ -1,3 +1,14 @@
+<p style="align: left; margin: 0; padding: 0;">
+  <img
+    src="images/banner.png"
+    alt="slapp-rs banner"
+    width="300em"
+    style="max-width: 100%; height: auto"
+  />
+  <br />
+  <sub>Banner artist: <a href="https://x.com/LophasiaA">LophasiaA</a></sub>
+</p>
+
 # slapp-rs
 
 Framework for building MitM applications.
