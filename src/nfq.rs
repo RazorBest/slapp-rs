@@ -132,11 +132,11 @@ where
             ret = self.verdict(msg, async_fd) => {
                 ret?;
             },
-            _ = tokio::spawn(async move {
+            _ = async move {
                 while running.load(Ordering::SeqCst) {
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
-            }) => (),
+            } => (),
         }
 
         Ok(())
